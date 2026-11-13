@@ -1,0 +1,11 @@
+# 密钥
+.mtd_api_key
+
+# 运行时生成的数据
+.cache/
+fleet/
+vehicles.json
+history/
+
+__pycache__/
+.DS_Store
