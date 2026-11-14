@@ -1,0 +1,18 @@
+# Caddy 反向代理：自动申请 Let's Encrypt 证书，HTTP 自动跳转 HTTPS。
+# 把下面的域名换成你自己的（A 记录指向这台机器的弹性 IP），
+# 没有域名可以用 <IP 用横线连接>.sslip.io，例如 3-14-15-92.sslip.io。
+# 机器上没有别的 Caddy 站点：装到 /etc/caddy/Caddyfile。
+# 已经有：把下面的站点块追加到现有 /etc/caddy/Caddyfile 末尾，不要覆盖。
+# 然后 sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
+
+your-domain.example.com {
+	encode gzip
+	reverse_proxy 127.0.0.1:8010
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		-Server
+	}
+}

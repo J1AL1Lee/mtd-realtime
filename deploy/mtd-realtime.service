@@ -1,0 +1,30 @@
+# systemd 服务：开机自启，崩溃自动重启。装到 /etc/systemd/system/mtd-realtime.service
+# API key 放在 /etc/mtd-realtime.env（一行 MTD_API_KEY=你的key，权限 600，属主 root）
+
+[Unit]
+Description=MTD realtime vehicle page
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=mtd
+Group=mtd
+WorkingDirectory=/opt/mtd-realtime
+EnvironmentFile=/etc/mtd-realtime.env
+Environment=PYTHONUNBUFFERED=1
+# 每次启动先更新车型表；失败（前面的 -）不影响网页启动
+ExecStartPre=-/usr/bin/python3 fetch_fleet.py
+# 只监听本机，外面只能经过 Caddy 的 HTTPS 访问。8000 常被别的服务占用，这里用 8010
+ExecStart=/usr/bin/python3 web.py --host 127.0.0.1 --port 8010
+Restart=always
+RestartSec=5
+
+# 加固：系统目录只读，只有项目目录可写（.cache/ 和 fleet/）
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/mtd-realtime
+
+[Install]
+WantedBy=multi-user.target
