@@ -6,7 +6,9 @@
   MTD v3 API /vehicles/locations                    GPS 坐标，仅在数据新鲜时显示
     （该接口有时会卡在旧快照上，lastUpdated 超过 GPS_MAX_AGE 就不用）
 
-后台线程每 SCRAPE_INTERVAL 秒抓一轮全部站点（约 20 秒），网页只读内存里的最新结果。
+后台线程每 SCRAPE_INTERVAL 秒抓一轮，网页只读内存里的最新结果。为了少给 mtd.org
+添负担，只抓抽样出来的约 130 个站点（见 mtd_vehicles.sample_stops），而不是全部约 1000 个；
+代价是“下一站”显示的是前方最近的抽样站点，不一定是车实际的下一站。
 车型取自 fleet/fleet.csv。
 
 用法：
@@ -28,13 +30,15 @@ from urllib.parse import parse_qs, urlparse
 import mtd_vehicles
 from fetch_fleet import HERE, api_get, load_api_key
 
-SCRAPE_INTERVAL = 60      # 两轮抓取的间隔秒数
-WORKERS = 12              # 抓站点的并发数
+SCRAPE_INTERVAL = 180     # 两轮抓取的间隔秒数
+STOP_GAP = 10             # 抽样站点：每个班次沿途每这么多分钟至少一个站
+STOPS_RELOAD = 24 * 3600  # 隔多久重新读站点和时刻表（GTFS 本地缓存一周）
+WORKERS = 4               # 抓站点的并发数
 GPS_MAX_AGE = 300         # v3 GPS 超过这么多秒就视为过期
 REFRESH = 30              # 页面自动刷新秒数
 
 API_KEY = load_api_key()
-state = {"vehicles": [], "gps": {}, "fetched_at": None, "error": None}
+state = {"vehicles": [], "gps": {}, "fetched_at": None, "error": None, "failed": 0, "stop_count": 0}
 
 
 def load_models():
@@ -66,13 +70,20 @@ def fresh_gps():
 
 
 def scrape_loop():
-    stops = mtd_vehicles.load_stops()
+    stops, loaded_at = None, 0
     while True:
         start = time.time()
         try:
-            vehicles, _ = mtd_vehicles.collect(stops, WORKERS)
-            state.update(vehicles=vehicles, gps=fresh_gps(), fetched_at=datetime.now(), error=None)
-            print(f"{datetime.now():%H:%M:%S} {len(vehicles)} 辆，用时 {time.time() - start:.0f}s", file=sys.stderr)
+            if start - loaded_at > STOPS_RELOAD:
+                stops = mtd_vehicles.sample_stops(mtd_vehicles.load_stops(), STOP_GAP)
+                loaded_at = start
+                print(f"抽样站点 {len(stops)} 个", file=sys.stderr)
+            vehicles, failed = mtd_vehicles.collect(stops, WORKERS)
+            state.update(vehicles=vehicles, gps=fresh_gps(), fetched_at=datetime.now(),
+                         error=None, failed=len(failed), stop_count=len(stops))
+            # 失败数突然变多，可能是被 mtd.org 限速或拦截了
+            print(f"{datetime.now():%H:%M:%S} {len(vehicles)} 辆，{len(failed)}/{len(stops)} 站失败，"
+                  f"用时 {time.time() - start:.0f}s", file=sys.stderr)
         except Exception as ex:
             state["error"] = str(ex)
             print(f"抓取失败: {ex}", file=sys.stderr)
@@ -96,7 +107,9 @@ def e(s):
 
 def page(title, body):
     t = state["fetched_at"]
-    status = f"数据时间 {t:%H:%M:%S}" if t else "首次抓取中，约 20 秒后刷新"
+    status = f"数据时间 {t:%H:%M:%S}" if t else "首次抓取中，稍后自动刷新"
+    if state["failed"]:
+        status += f"，{state['failed']}/{state['stop_count']} 个站点抓取失败"
     if state["error"]:
         status += f"，上一轮失败：{e(state['error'])}"
     return f"""<!doctype html>

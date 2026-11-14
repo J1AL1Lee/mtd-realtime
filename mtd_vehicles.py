@@ -10,11 +10,13 @@ uniqueId 格式：v-<车号>_t-<trip>_b-<block>_sd-<YYYYMMDD-HHMMSS 计划时间
 用法：
   python3 mtd_vehicles.py                   # 抓一次，打印汇总并写 vehicles.json
   python3 mtd_vehicles.py --loop 120        # 每 120 秒抓一次
+  python3 mtd_vehicles.py --gap 10          # 只抓抽样站点（约 130 个），见 sample_stops
   python3 mtd_vehicles.py --stops IT,INDIGO # 只抓指定站点（调试用）
 """
 
 import argparse
 import csv
+import heapq
 import io
 import json
 import re
@@ -31,8 +33,8 @@ GTFS_URL = "https://developer.mtd.org/gtfs/google_transit.zip"
 INFO_URL = "https://mtd.org/umbraco/api/realtime/info/?stopId={}"
 USER_AGENT = "Mozilla/5.0 (mtd_vehicles.py)"
 CACHE_DIR = Path(__file__).resolve().parent / ".cache"
-STOPS_CACHE = CACHE_DIR / "stops.json"
-STOPS_CACHE_MAX_AGE = 7 * 24 * 3600
+GTFS_CACHE = CACHE_DIR / "google_transit.zip"
+GTFS_CACHE_MAX_AGE = 7 * 24 * 3600
 
 UNIQUE_ID_RE = re.compile(
     r"^v-(?P<vehicle>[^_]*)_t-(?P<trip>.*?)_b-(?P<block>.*)_sd-(?P<sched>\d{8}-\d{6})$"
@@ -51,18 +53,31 @@ def http_get(url, timeout=20, retries=3):
             time.sleep(1.5 * (attempt + 1))
 
 
-def load_stops(refresh=False):
-    """返回父站点列表 [{id, name, code, lat, lon}]，带一周缓存。"""
+def load_gtfs(refresh=False):
+    """返回 GTFS 压缩包（ZipFile），本地缓存一周。"""
     if (
-        not refresh
-        and STOPS_CACHE.exists()
-        and time.time() - STOPS_CACHE.stat().st_mtime < STOPS_CACHE_MAX_AGE
+        refresh
+        or not GTFS_CACHE.exists()
+        or time.time() - GTFS_CACHE.stat().st_mtime > GTFS_CACHE_MAX_AGE
     ):
-        return json.loads(STOPS_CACHE.read_text())
+        print("下载 GTFS…", file=sys.stderr)
+        data = http_get(GTFS_URL, timeout=60)
+        CACHE_DIR.mkdir(exist_ok=True)
+        tmp = GTFS_CACHE.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(GTFS_CACHE)  # 先写临时文件再替换，下载中断不会留下坏的缓存
+    return zipfile.ZipFile(GTFS_CACHE)
 
-    print("下载 GTFS 站点列表…", file=sys.stderr)
-    with zipfile.ZipFile(io.BytesIO(http_get(GTFS_URL, timeout=60))) as zf:
-        rows = list(csv.DictReader(io.TextIOWrapper(zf.open("stops.txt"), "utf-8-sig")))
+
+def read_gtfs_csv(zf, name):
+    with zf.open(name) as f:
+        return list(csv.DictReader(io.TextIOWrapper(f, "utf-8-sig")))
+
+
+def load_stops(refresh=False):
+    """返回父站点列表 [{id, name, code, lat, lon}]。"""
+    with load_gtfs(refresh) as zf:
+        rows = read_gtfs_csv(zf, "stops.txt")
 
     stops = {}
     for r in rows:
@@ -76,10 +91,56 @@ def load_stops(refresh=False):
                 "lat": float(r["stop_lat"]),
                 "lon": float(r["stop_lon"]),
             }
-    result = sorted(stops.values(), key=lambda s: s["id"])
-    CACHE_DIR.mkdir(exist_ok=True)
-    STOPS_CACHE.write_text(json.dumps(result, ensure_ascii=False))
-    return result
+    return sorted(stops.values(), key=lambda s: s["id"])
+
+
+def sample_stops(stops, gap):
+    """从 stops 里挑一小部分站点来抓，仍能看到所有在跑的车。
+
+    mtd.org 每个站点只预测约 60 分钟内到站的车。只要每个班次沿途每 gap 分钟内
+    都有一个被选中的站（外加终点站），任何一辆在跑的车前方 2*gap 分钟内必有一个
+    被选中的站，也就一定会出现在抓取结果里。gap 越大抓的站越少，但“下一站”
+    显示的是前方最近的被选站点，离车的实际位置也越远。
+
+    用贪心集合覆盖：每次选能补上最多“班次 × 时间段”空缺的站点。
+    """
+
+    def minutes(hms):
+        h, m, _ = hms.split(":")
+        return int(h) * 60 + int(m)
+
+    with load_gtfs() as zf:
+        rows = read_gtfs_csv(zf, "stop_times.txt")
+    trips = {}
+    for r in rows:
+        t = r["arrival_time"] or r["departure_time"]
+        if t:
+            trips.setdefault(r["trip_id"], []).append(
+                (int(r["stop_sequence"]), minutes(t), r["stop_id"].split(":")[0])
+            )
+
+    covers = {}  # 站点 -> 它能覆盖的 {(班次序号, 时间段)}
+    for i, visits in enumerate(trips.values()):
+        visits.sort()
+        start = visits[0][1]
+        for _, t, sid in visits:
+            covers.setdefault(sid, set()).add((i, (t - start) // gap))
+        covers[visits[-1][2]].add((i, "end"))  # 终点站：车跑完最后一段之前都能在这里看到它
+
+    # 惰性贪心：堆里的覆盖数可能过期，取出时重算，仍是最大的才选
+    left = set().union(*covers.values())
+    heap = [(-len(c), sid) for sid, c in covers.items()]
+    heapq.heapify(heap)
+    chosen = set()
+    while left:
+        _, sid = heapq.heappop(heap)
+        gain = len(covers[sid] & left)
+        if heap and gain < -heap[0][0]:
+            heapq.heappush(heap, (-gain, sid))
+            continue
+        chosen.add(sid)
+        left -= covers[sid]
+    return [s for s in stops if s["id"] in chosen]
 
 
 def fetch_stop(stop_id):
@@ -187,6 +248,8 @@ def run_once(args):
         stops = [s for s in stops if s["id"] in wanted] or [
             {"id": w, "name": w, "code": "", "lat": None, "lon": None} for w in wanted
         ]
+    elif args.gap:
+        stops = sample_stops(stops, args.gap)
     fetched_at = datetime.now()
     t0 = time.time()
     vehicles, failed = collect(stops, args.workers)
@@ -215,6 +278,8 @@ def main():
     p.add_argument("-w", "--workers", type=int, default=6, help="并发请求数 (默认 6)")
     p.add_argument("--loop", type=int, metavar="SECONDS", help="循环抓取间隔秒数")
     p.add_argument("--history", metavar="DIR", help="每次抓取另存一份带时间戳的快照到该目录")
+    p.add_argument("--gap", type=int, metavar="MINUTES",
+                   help="只抓抽样站点：每个班次沿途每这么多分钟至少一个站 (web.py 用 10)")
     p.add_argument("--stops", help="只抓这些父站点 ID，逗号分隔")
     p.add_argument("--refresh-stops", action="store_true", help="强制重新下载 GTFS 站点列表")
     args = p.parse_args()
